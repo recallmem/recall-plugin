@@ -20,11 +20,11 @@ back. If Recall is down, Claude Code behaves exactly as without the plugin.
 Needs Claude Code with plugin support and Node 18+ on your `PATH`.
 
 ```text
-/plugin marketplace add RedSix6/recall-plugin
+/plugin marketplace add recallmem/recall-plugin
 /plugin install recall-memory@recall
 ```
 
-(`claude plugin marketplace add RedSix6/recall-plugin` and `claude plugin install recall-memory@recall` do the same
+(`claude plugin marketplace add recallmem/recall-plugin` and `claude plugin install recall-memory@recall` do the same
 from a shell. Developing locally? `claude --plugin-dir <path to this folder>`.)
 
 When you enable the plugin, Claude Code asks for your **Recall API key** (create one at
@@ -88,10 +88,10 @@ Hooks never print errors into the session. They log to `hooks.log` in the plugin
 ## Other agents
 
 The same repository has Recall for other agents, each with its own README:
-[Codex](https://github.com/RedSix6/recall-plugin/tree/main/integrations/codex),
-[OpenClaw](https://github.com/RedSix6/recall-plugin/tree/main/integrations/openclaw),
-[Hermes](https://github.com/RedSix6/recall-plugin/tree/main/integrations/hermes) and an
-[Agent Skill](https://github.com/RedSix6/recall-plugin/tree/main/integrations/agent-skill) for any host that loads
+[Codex](https://github.com/recallmem/recall-plugin/tree/main/integrations/codex),
+[OpenClaw](https://github.com/recallmem/recall-plugin/tree/main/integrations/openclaw),
+[Hermes](https://github.com/recallmem/recall-plugin/tree/main/integrations/hermes) and an
+[Agent Skill](https://github.com/recallmem/recall-plugin/tree/main/integrations/agent-skill) for any host that loads
 skills. Any MCP client can also connect to `https://api.recallmem.dev/mcp`.
 
 ## Development

@@ -5,8 +5,8 @@ person from their conversations, notices when that changes, and answers with sou
 
 | Agent | Where | Install |
 |---|---|---|
-| Claude Code | [`plugins/recall-memory`](plugins/recall-memory) | `/plugin marketplace add RedSix6/recall-plugin`, then `/plugin install recall-memory@recall` |
-| Codex | [`integrations/codex`](integrations/codex) | `codex plugin marketplace add RedSix6/recall-plugin`, then `codex plugin add recall-memory@recall` |
+| Claude Code | [`plugins/recall-memory`](plugins/recall-memory) | `/plugin marketplace add recallmem/recall-plugin`, then `/plugin install recall-memory@recall` |
+| Codex | [`integrations/codex`](integrations/codex) | `codex plugin marketplace add recallmem/recall-plugin`, then `codex plugin add recall-memory@recall` |
 | OpenClaw | [`integrations/openclaw`](integrations/openclaw) | see its README |
 | Hermes | [`integrations/hermes`](integrations/hermes) | see its README |
 | Any agent with skills | [`integrations/agent-skill`](integrations/agent-skill) | see its README |
