@@ -77,7 +77,7 @@ To switch Recall off for one project, set `RECALL_ENABLED=false` under `env` in 
 
 Your prompts and Claude's final replies (not tool calls or file contents, and each cut to 24,000 characters) go to the
 Recall server you configured, which analyses them with its language model. Do not point this at a server you do not
-trust, and use `record: false` or `RECALL_ENABLED=false` for work you do not want remembered.
+trust, and set `RECALL_RECORD=false` or `RECALL_ENABLED=false` for work you do not want remembered.
 
 ## Troubleshooting
 
