@@ -33,5 +33,5 @@ export const HOST_INFO = {
   /** API key: RECALL_API_KEY, then `apiKey` in ~/.recall/config.json (as written by `recall init` or install.mjs). */
   apiKey: (env, fromFile) => env.RECALL_API_KEY || fromFile("apiKey", "auth.apiKey"),
   /** Shown when the server refuses the key. */
-  keyHint: "Set RECALL_API_KEY or run `recall init`.",
+  keyHint: "Set RECALL_API_KEY, or apiKey in ~/.recall/config.json.",
 };

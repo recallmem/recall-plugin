@@ -31,7 +31,7 @@ When you enable the plugin, Claude Code asks for your **Recall API key** (create
 https://app.recallmem.dev/keys). It is stored in your system's secure credential store, and you can change it, the
 server URL, workspace and your name any time under `/plugin` → recall-memory → Configure. The defaults are the hosted
 service at `https://api.recallmem.dev`, workspace `default`, and your OS user name. Self-hosting: set the server URL
-to your own, e.g. `http://localhost:8000` (`recall start`); no API key is needed until you turn auth on. The URL,
+to your own, e.g. `http://localhost:8000` (https://recallmem.dev/docs#self-host); no API key is needed until you turn auth on. The URL,
 workspace and peer can also come from `RECALL_URL`, `RECALL_WORKSPACE_ID`, `RECALL_PEER_ID` or
 `~/.recall/config.json`; the key only ever comes from the plugin setting.
 

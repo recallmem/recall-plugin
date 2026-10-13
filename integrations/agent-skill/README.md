@@ -29,10 +29,10 @@ mkdir -p ~/.agents/skills && cp -r recall-plugin/integrations/agent-skill/recall
 ## Configuration
 
 The skill needs no configuration when the agent has Recall's MCP tools. For the helper script, set `RECALL_URL`,
-`RECALL_API_KEY`, `RECALL_WORKSPACE_ID` and `RECALL_PEER_ID`, or run `recall init` once to write
-`~/.recall/config.json`. Defaults: `https://api.recallmem.dev`,
-workspace `default`, your OS user name as the peer. Every command also takes `--url`, `--api-key`, `--workspace`
-and `--peer`.
+`RECALL_API_KEY`, `RECALL_WORKSPACE_ID` and `RECALL_PEER_ID`, or put them in `~/.recall/config.json`
+(`{"url": "...", "apiKey": "pk_live_...", "workspace": "...", "peer": "..."}`; the server's command line writes it
+with `recall init`). Defaults: `https://api.recallmem.dev`, workspace `default`, your OS user name as the peer.
+Every command also takes `--url`, `--api-key`, `--workspace` and `--peer`.
 
 ## What it records and injects
 

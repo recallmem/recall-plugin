@@ -160,6 +160,8 @@ class ProviderTest(TempHome):
         p = self.make()
         p.initialize("s1", hermes_home=str(self.hermes_home), platform="cli")
         self.assertEqual(p.prefetch("anything"), "")
+        # Nothing stored yet: the unknown workspace answers 404, which is no answer, not an error.
+        self.assertEqual(self.tool(p, "recall_ask", question="What does Lucas drink?"), {"answer": "Memory has no answer to that."})
         saved = self.tool(p, "recall_remember", facts=["Lucas drinks oat flat whites", " "])
         self.assertEqual([f["content"] for f in saved["saved"]], ["Lucas drinks oat flat whites"])
         fact_id = saved["saved"][0]["id"]

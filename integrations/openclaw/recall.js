@@ -311,9 +311,10 @@ export class RecallClient {
 
   // ---- tools ---------------------------------------------------------------
 
-  async must(method, path, body) {
+  async must(method, path, body, { missingOk = false } = {}) {
     const res = await this.request(method, path, { body, timeoutMs: 120_000 });
     if (res.status >= 200 && res.status < 300) return res.json;
+    if (missingOk && res.status === 404) return null;
     if (res.status === 0) throw new Error(`Recall is unreachable at ${this.settings.url}`);
     const detail = typeof res.json?.detail === "string" ? res.json.detail : `HTTP ${res.status}`;
     throw new Error(`Recall refused the request: ${detail}`);
@@ -334,10 +335,13 @@ export class RecallClient {
   }
 
   async ask(peer, query, level = "low") {
-    const res = await this.must("POST", this.ws(`/peers/${encodeURIComponent(peer)}/chat`), {
-      query,
-      reasoning_level: level,
-    });
+    // A workspace or person memory has never seen answers 404: no answer yet, not an error.
+    const res = await this.must(
+      "POST",
+      this.ws(`/peers/${encodeURIComponent(peer)}/chat`),
+      { query, reasoning_level: level },
+      { missingOk: true },
+    );
     return typeof res?.content === "string" && res.content.trim() ? res.content.trim() : null;
   }
 

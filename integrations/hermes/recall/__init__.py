@@ -272,10 +272,12 @@ class RecallClient:
     def ws(self, path: str = "") -> str:
         return f"/v3/workspaces/{urllib.parse.quote(self.s['workspace'], safe='')}{path}"
 
-    def must(self, method: str, path: str, body: Any = None) -> Any:
+    def must(self, method: str, path: str, body: Any = None, missing_ok: bool = False) -> Any:
         status, data = self.request(method, path, body, timeout=120)
         if 200 <= status < 300:
             return data
+        if missing_ok and status == 404:
+            return None
         if status == 0:
             raise RecallError(f"Recall is unreachable at {self.s['url']}")
         detail = data.get("detail") if isinstance(data, dict) else None
@@ -661,7 +663,13 @@ class RecallMemoryProvider(MemoryProvider):
             if not question:
                 raise RecallError("question is required")
             level = args.get("level") if args.get("level") in ("minimal", "low", "medium", "high", "max") else "low"
-            res = c.must("POST", c.ws(f"/peers/{quoted}/chat"), {"query": question, "reasoning_level": level})
+            # A workspace or person memory has never seen answers 404: no answer yet, not an error.
+            res = c.must(
+                "POST",
+                c.ws(f"/peers/{quoted}/chat"),
+                {"query": question, "reasoning_level": level},
+                missing_ok=True,
+            )
             answer = _str(res.get("content")) if isinstance(res, dict) else None
             return {"answer": answer or "Memory has no answer to that."}
         if name == "recall_remember":

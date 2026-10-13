@@ -1,6 +1,7 @@
 {
   "name": "@recall-memory/openclaw",
   "version": "0.1.0",
+  "license": "MIT",
   "description": "OpenClaw plugin: long-term memory from Recall.",
   "type": "module",
   "private": true,

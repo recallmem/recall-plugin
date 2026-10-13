@@ -28,7 +28,7 @@ Options
   --json                       print the server's JSON instead of text
 
 Settings come from RECALL_URL, RECALL_API_KEY, RECALL_WORKSPACE_ID and RECALL_PEER_ID,
-then ~/.recall/config.json (written by \`recall init\`).`;
+then ~/.recall/config.json ({"url", "apiKey", "workspace", "peer"}; \`recall init\` writes it).`;
 
 const MAX_CHARS = 24_000;
 
@@ -184,11 +184,14 @@ async function context(s, flags) {
 async function ask(s, flags, args) {
   const query = args.join(" ").trim();
   if (!query) throw new RecallError('ask needs a question, e.g. ask "Where does the user live?"');
-  const res = await must(s, "POST", peerPath(s, "/chat"), {
+  const res = await call(s, "POST", peerPath(s, "/chat"), {
     query,
     reasoning_level: flags.level ?? "low",
   });
-  return { json: res, text: [str(res?.content) ?? "Memory has no answer to that."] };
+  // A workspace or person memory has never seen answers 404: there is nothing to ask yet.
+  if (res.status === 404) return { json: null, text: [`Memory has nothing about ${s.peer} yet.`] };
+  if (res.status !== 200) throw failure(res);
+  return { json: res.json, text: [str(res.json?.content) ?? "Memory has no answer to that."] };
 }
 
 async function search(s, flags, args) {
