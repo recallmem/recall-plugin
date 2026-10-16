@@ -2,7 +2,7 @@
 // Prints the settings the hooks use and whether Recall answers.
 //   node scripts/status.mjs
 
-import { HOST, loadSettings, request } from "./lib.mjs";
+import { HOST, loadSettings, loadState, request } from "./lib.mjs";
 
 const s = loadSettings();
 const key = s.apiKey
@@ -21,6 +21,12 @@ const lines = [
   `mcp profile     ${s.mcpProfile}`,
   `config file     ${s.configPath ?? "(none found)"}`,
 ];
+const st = loadState();
+if (st.spool.length)
+  lines.push(
+    `unsent          ${st.spool.length} waiting since ${new Date(st.spool[0].at ?? Date.now()).toISOString()}`,
+  );
+if (st.dropped) lines.push(`lost            ${st.dropped} messages since ${st.droppedSince}`);
 console.log(lines.join("\n"));
 
 const health = await request(s, "GET", "/health", { timeoutMs: 5000 });

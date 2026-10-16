@@ -1,7 +1,10 @@
 // Shared code for the Recall memory hooks and MCP bridge of coding agents.
 // Plain Node (18+), no dependencies. Hooks must never get in the user's way, so
-// everything here is written to fail quietly: short timeouts, a circuit breaker
-// after a failure, and a small on-disk spool so a brief outage loses nothing.
+// everything here is written to fail open: short timeouts, a circuit breaker
+// after a failure, and an on-disk spool that keeps unsent messages, in order and
+// with the time they were said, until Recall answers again. What could not be
+// kept is counted and reported (status, and the next session's context), never
+// dropped silently.
 //
 // This file is identical in integrations/claude-code/scripts and
 // integrations/codex/scripts; what differs per agent lives in ./host.mjs.
@@ -13,6 +16,7 @@ import {
   mkdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   statSync,
   writeFileSync,
 } from "node:fs";
@@ -23,7 +27,8 @@ import { HOST_INFO } from "./host.mjs";
 export const PLUGIN_VERSION = HOST_INFO.version;
 export const HOST = HOST_INFO.id;
 const MAX_CONTENT_CHARS = 24_000; // the server accepts 25,000 per message
-const SPOOL_MAX = 100;
+const MAX_PARTS = 100; // the server accepts 100 messages per request
+const SPOOL_MAX = 500;
 const SPOOL_FLUSH_PER_RUN = 10;
 const LOG_MAX_BYTES = 200_000;
 
@@ -161,22 +166,93 @@ export function loadState(env = process.env) {
     breakerUntil: Number(data.breakerUntil) || 0,
     sessions: data.sessions && typeof data.sessions === "object" ? data.sessions : {},
     spool: Array.isArray(data.spool) ? data.spool : [],
+    /** Messages the spool had to let go of while Recall was unreachable, not yet reported. */
+    dropped: Number(data.dropped) || 0,
+    droppedSince: typeof data.droppedSince === "string" ? data.droppedSince : null,
+    // This run only: messages it let go of, whether it reported the loss, and the keys it
+    // delivered or let go of (so saving does not bring them back).
+    lost: 0,
+    lostSince: null,
+    reported: false,
+    done: new Set(),
   };
+}
+
+/**
+ * Hooks of parallel agent sessions can run at once, each with its own copy of the state.
+ * Saving merges with what is on disk: every unsent message either copy holds is kept, in
+ * the order they were said, except those this run delivered.
+ */
+function merge(state, disk) {
+  const byKey = new Map();
+  for (const e of [...disk.spool, ...state.spool]) if (!state.done.has(e.key)) byKey.set(e.key, e);
+  const spool = [...byKey.values()].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
+  const over = Math.max(0, spool.length - SPOOL_MAX);
+  const dropped = (state.reported ? 0 : disk.dropped) + state.lost + over;
+  return {
+    breakerUntil: state.breakerUntil,
+    sessions: { ...disk.sessions, ...state.sessions },
+    spool: spool.slice(over),
+    dropped,
+    droppedSince: dropped
+      ? ((state.reported ? null : disk.droppedSince) ?? state.lostSince ?? new Date().toISOString())
+      : null,
+  };
+}
+
+/**
+ * Runs `fn` holding a lock directory next to the state, so two hooks never read and write
+ * the state file at once. Waits at most about two seconds; a lock older than ten seconds
+ * is left over from a killed hook and is taken over.
+ */
+function withLock(dir, fn) {
+  const lock = join(dir, "state.lock");
+  const deadline = Date.now() + 2000;
+  let held = false;
+  while (!held) {
+    try {
+      mkdirSync(lock);
+      held = true;
+    } catch (err) {
+      if (err?.code !== "EEXIST") break; // cannot lock here: go on without
+      try {
+        if (Date.now() - statSync(lock).mtimeMs > 10_000) rmdirSync(lock);
+      } catch {
+        // Released meanwhile.
+      }
+      if (Date.now() > deadline) break;
+      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
+    }
+  }
+  try {
+    return fn();
+  } finally {
+    if (held) {
+      try {
+        rmdirSync(lock);
+      } catch {
+        // Already gone.
+      }
+    }
+  }
 }
 
 export function saveState(state, env = process.env) {
   try {
     const dir = stateDir(env);
     mkdirSync(dir, { recursive: true });
-    const keep = Object.entries(state.sessions)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 50);
-    const file = join(dir, "state.json");
-    const tmp = `${file}.${process.pid}.tmp`;
-    writeFileSync(tmp, JSON.stringify({ ...state, sessions: Object.fromEntries(keep) }), {
-      mode: 0o600,
+    withLock(dir, () => {
+      const merged = merge(state, loadState(env));
+      const keep = Object.entries(merged.sessions)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 50);
+      const file = join(dir, "state.json");
+      const tmp = `${file}.${process.pid}.tmp`;
+      writeFileSync(tmp, JSON.stringify({ ...merged, sessions: Object.fromEntries(keep) }), {
+        mode: 0o600,
+      });
+      renameSync(tmp, file);
     });
-    renameSync(tmp, file);
   } catch {
     // State is an optimisation; losing it must not matter.
   }
@@ -245,12 +321,46 @@ const ws = (settings, path) => `/v3/workspaces/${encodeURIComponent(settings.wor
 // Recording
 // ---------------------------------------------------------------------------
 
-export const clip = (text) => {
+/**
+ * A message as the parts the server accepts: up to 24,000 characters each, in order, never
+ * cutting a character in two. Only text longer than 100 parts (2.4 million characters) loses
+ * its end, and says so.
+ */
+export function split(text) {
   const s = String(text ?? "");
-  return s.length > MAX_CONTENT_CHARS
-    ? `${s.slice(0, MAX_CONTENT_CHARS)}\n[truncated by the Recall plugin]`
-    : s;
-};
+  const parts = [];
+  let i = 0;
+  while (i < s.length && parts.length < MAX_PARTS) {
+    let end = Math.min(i + MAX_CONTENT_CHARS, s.length);
+    const code = s.charCodeAt(end - 1);
+    if (end < s.length && code >= 0xd800 && code <= 0xdbff) end--;
+    parts.push(s.slice(i, end));
+    i = end;
+  }
+  if (i < s.length) {
+    const note = `\n[cut by the Recall plugin: ${s.length - i} more characters]`;
+    parts[parts.length - 1] =
+      parts[parts.length - 1].slice(0, MAX_CONTENT_CHARS - note.length) + note;
+  }
+  return parts;
+}
+
+/**
+ * The messages that record `text` said by `peerId`, stamped with the time it was said, so a
+ * message sent late (after an outage) keeps its place in time.
+ */
+export function messagesOf(peerId, text, input, at = new Date()) {
+  const parts = split(text);
+  return parts.map((content, i) => ({
+    peer_id: peerId,
+    content,
+    created_at: at.toISOString(),
+    metadata: {
+      ...messageMetadata(input),
+      ...(parts.length > 1 ? { part: i + 1, parts: parts.length } : {}),
+    },
+  }));
+}
 
 /** A stable key: the same turn replayed from the spool is stored once. */
 export const idempotencyKey = (prefix, ...parts) =>
@@ -307,39 +417,58 @@ async function deliver(settings, state, entry) {
   return transient(res.status) ? "retry" : "drop";
 }
 
-/** Retries what an earlier outage left behind, oldest first, a few at a time. */
+/**
+ * Retries what an earlier outage left behind, oldest first, a few at a time: "empty" when
+ * nothing is left, "busy" when older messages still wait (a new one must queue behind them),
+ * "down" when Recall did not take them.
+ */
 async function flushSpool(settings, state) {
   let sent = 0;
-  while (state.spool.length && sent < SPOOL_FLUSH_PER_RUN) {
-    const outcome = await deliver(settings, state, state.spool[0]);
-    if (outcome === "retry") return false;
-    if (outcome === "drop") log(settings, `dropped a rejected message (${state.spool[0].key})`);
+  while (state.spool.length) {
+    if (sent >= SPOOL_FLUSH_PER_RUN) return "busy";
+    const entry = state.spool[0];
+    const outcome = await deliver(settings, state, entry);
+    if (outcome === "retry") return "down";
+    if (outcome === "drop") log(settings, `the server rejected message ${entry.key}; dropped`);
+    state.done.add(entry.key);
     state.spool.shift();
     sent++;
   }
-  return true;
+  return "empty";
 }
 
-const enqueue = (state, entry) => {
+/** Keeps an entry for later, after the ones already waiting. A full spool lets go of the oldest, and counts it. */
+function enqueue(settings, state, entry, env = process.env) {
   if (state.spool.some((e) => e.key === entry.key)) return;
   state.spool.push(entry);
-  while (state.spool.length > SPOOL_MAX) state.spool.shift();
-};
+  while (state.spool.length > SPOOL_MAX) {
+    const lost = state.spool.shift();
+    state.done.add(lost.key);
+    state.lost++;
+    state.lostSince ??= new Date(lost.at ?? Date.now()).toISOString();
+    log(settings, `spool full (${SPOOL_MAX} messages): let go of ${lost.key}, the oldest`, env);
+  }
+}
 
 /**
  * Records messages into the session: older unsent messages first, then these. If
  * Recall is down the entry is spooled (and the breaker trips), never raised.
  */
-export async function record(settings, state, entry, env = process.env) {
-  if (breakerOpen(state)) return enqueue(state, entry);
-  if (!(await flushSpool(settings, state))) {
+export async function record(settings, state, input, env = process.env) {
+  const entry = { at: Date.now(), ...input };
+  if (breakerOpen(state)) return enqueue(settings, state, entry, env);
+  const backlog = await flushSpool(settings, state);
+  if (backlog === "down") {
     tripBreaker(state, env);
-    return enqueue(state, entry);
+    return enqueue(settings, state, entry, env);
   }
+  // Older messages still waiting go first; this one follows them on a later hook.
+  if (backlog === "busy") return enqueue(settings, state, entry, env);
   const outcome = await deliver(settings, state, entry);
+  if (outcome !== "retry") state.done.add(entry.key);
   if (outcome === "retry") {
     tripBreaker(state, env);
-    enqueue(state, entry);
+    enqueue(settings, state, entry, env);
     log(
       settings,
       `could not reach ${settings.url}; message kept for later (${state.spool.length} waiting)`,
@@ -390,6 +519,28 @@ export async function fetchMemory(
   const representation =
     typeof res.json.representation === "string" ? res.json.representation.trim() : "";
   return card.length || representation ? { card, representation } : null;
+}
+
+/**
+ * A line for the agent's context when memory is behind: messages waiting to be stored, or let
+ * go of during a long outage. Reporting the loss clears the count.
+ */
+export function backlogNotice(state) {
+  const notes = [];
+  if (state.spool.length)
+    notes.push(
+      `${state.spool.length} recorded message${state.spool.length === 1 ? " is" : "s are"} waiting to be stored in Recall (it could not be reached); memory below may be missing them.`,
+    );
+  const lost = state.dropped + state.lost;
+  if (lost) {
+    notes.push(
+      `${lost} message${lost === 1 ? " was" : "s were"} not stored: Recall was unreachable for longer than the plugin can keep messages (since ${state.droppedSince ?? state.lostSince}).`,
+    );
+    state.reported = true;
+    state.lost = 0;
+    state.lostSince = null;
+  }
+  return notes.length ? `Recall memory status: ${notes.join(" ")}` : "";
 }
 
 /** Memory as plain factual text for the agent's context, within roughly `tokens` tokens. */

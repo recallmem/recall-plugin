@@ -75,9 +75,20 @@ To switch Recall off for one project, set `RECALL_ENABLED=false` under `env` in 
 
 ## What gets sent
 
-Your prompts and Claude's final replies (not tool calls or file contents, and each cut to 24,000 characters) go to the
-Recall server you configured, which analyses them with its language model. Do not point this at a server you do not
-trust, and set `RECALL_RECORD=false` or `RECALL_ENABLED=false` for work you do not want remembered.
+Your prompts and Claude's final replies go to the Recall server you configured, which analyses them with its language
+model. Tool calls, command output and file contents are not sent: Recall learns about you from what you say, and
+Claude's replies are stored as context, never as a source of facts about you. A message longer than the server's
+25,000-character limit is stored whole, as consecutive parts. Each message carries the time it was said. Do not point
+this at a server you do not trust, and set `RECALL_RECORD=false` or `RECALL_ENABLED=false` for work you do not want
+remembered.
+
+## When Recall cannot be reached
+
+The hooks never block Claude: a memory outage must not stop your work. Messages that cannot be sent are kept on disk,
+in order, and sent before anything newer once Recall answers again, with the time they were said. The spool holds 500
+messages; if an outage outlasts that, the oldest are let go of, and the next session's context and
+`/recall-memory:status` say how many and since when. While messages wait, the next session's context says memory may
+be missing them.
 
 ## Troubleshooting
 
