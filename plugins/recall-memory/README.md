@@ -84,11 +84,14 @@ remembered.
 
 ## When Recall cannot be reached
 
-The hooks never block Claude: a memory outage must not stop your work. Messages that cannot be sent are kept on disk,
-in order, and sent before anything newer once Recall answers again, with the time they were said. The spool holds 500
-messages; if an outage outlasts that, the oldest are let go of, and the next session's context and
-`/recall-memory:status` say how many and since when. While messages wait, the next session's context says memory may
-be missing them.
+The hooks never block Claude: a memory outage must not stop your work. They don't lose what they record either.
+Every prompt and reply is written to disk first, one file per message in the plugin's data directory, before
+anything is sent, and the file is removed only after Recall has taken the message. A hook that is stopped, or that
+runs at the same time as another session's hook, therefore leaves every message it accepted on disk. Messages are
+sent oldest first, with the time they were said, within a few seconds' budget so the hook always finishes well
+inside Claude Code's timeout; what is left goes with the next hook. The spool holds 500 messages; if an outage
+outlasts that, the oldest are let go of, and the next session's context and `/recall-memory:status` say how many
+and since when.
 
 ## Troubleshooting
 

@@ -22,7 +22,7 @@ await runHook("session-start", async ({ settings, input, state, env }) => {
     settings.lookup === "off"
       ? null
       : await fetchMemory(settings, state, { timeoutMs: settings.timeoutMs + 1000 }, env);
-  const text = [backlogNotice(state), memory ? renderMemory(settings, memory, { sessionId }) : ""]
+  const text = [backlogNotice(env), memory ? renderMemory(settings, memory, { sessionId }) : ""]
     .filter(Boolean)
     .join("\n\n");
   if (text) output = additionalContext("SessionStart", text);

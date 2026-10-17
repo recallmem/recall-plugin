@@ -1,10 +1,11 @@
 // Shared code for the Recall memory hooks and MCP bridge of coding agents.
 // Plain Node (18+), no dependencies. Hooks must never get in the user's way, so
-// everything here is written to fail open: short timeouts, a circuit breaker
-// after a failure, and an on-disk spool that keeps unsent messages, in order and
-// with the time they were said, until Recall answers again. What could not be
-// kept is counted and reported (status, and the next session's context), never
-// dropped silently.
+// everything here is written to fail open: short timeouts, a time budget well inside
+// the agent's hook timeout, and a circuit breaker after a failure. They must not lose
+// what they record either: every message is written to an on-disk spool, one file per
+// entry, before anything is sent, and leaves it only once Recall has taken it. What a
+// very long outage makes the spool let go of is counted and reported (status, and the
+// next session's context), never dropped silently.
 //
 // This file is identical in integrations/claude-code/scripts and
 // integrations/codex/scripts; what differs per agent lives in ./host.mjs.
@@ -14,10 +15,11 @@ import {
   appendFileSync,
   existsSync,
   mkdirSync,
+  readdirSync,
   readFileSync,
   renameSync,
-  rmdirSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { userInfo } from "node:os";
@@ -31,6 +33,8 @@ const MAX_PARTS = 100; // the server accepts 100 messages per request
 const SPOOL_MAX = 500;
 const SPOOL_FLUSH_PER_RUN = 10;
 const LOG_MAX_BYTES = 200_000;
+/** When this hook started: its sending stops HOOK_BUDGET_MS later, well inside the agent's timeout. */
+const STARTED = Date.now();
 
 // ---------------------------------------------------------------------------
 // Settings: environment, then the host's config file, if it has one (host.mjs)
@@ -159,102 +163,127 @@ export const messageMetadata = (input) => ({
 // ---------------------------------------------------------------------------
 
 const stateDir = (env = process.env) => HOST_INFO.stateDir(env);
+const spoolDir = (env = process.env) => join(stateDir(env), "spool");
+const lostDir = (env = process.env) => join(stateDir(env), "lost");
 
+/**
+ * state.json holds only what may be lost without harm: when the breaker closes again and
+ * which Recall sessions exist. Unsent messages are never in it (they are in the spool), so
+ * hooks that save it at the same time can only lose one of those hints, never a message.
+ */
 export function loadState(env = process.env) {
   const data = readJson(join(stateDir(env), "state.json")) ?? {};
+  // Version 0.2 kept unsent messages and the lost count in state.json: move them over once.
+  if (Array.isArray(data.spool)) for (const e of data.spool) if (e?.key) stage(e, env);
+  if (Number(data.dropped) > 0) markLost(Number(data.dropped), data.droppedSince, env);
   return {
     breakerUntil: Number(data.breakerUntil) || 0,
     sessions: data.sessions && typeof data.sessions === "object" ? data.sessions : {},
-    spool: Array.isArray(data.spool) ? data.spool : [],
-    /** Messages the spool had to let go of while Recall was unreachable, not yet reported. */
-    dropped: Number(data.dropped) || 0,
-    droppedSince: typeof data.droppedSince === "string" ? data.droppedSince : null,
-    // This run only: messages it let go of, whether it reported the loss, and the keys it
-    // delivered or let go of (so saving does not bring them back).
-    lost: 0,
-    lostSince: null,
-    reported: false,
-    done: new Set(),
   };
-}
-
-/**
- * Hooks of parallel agent sessions can run at once, each with its own copy of the state.
- * Saving merges with what is on disk: every unsent message either copy holds is kept, in
- * the order they were said, except those this run delivered.
- */
-function merge(state, disk) {
-  const byKey = new Map();
-  for (const e of [...disk.spool, ...state.spool]) if (!state.done.has(e.key)) byKey.set(e.key, e);
-  const spool = [...byKey.values()].sort((a, b) => (a.at ?? 0) - (b.at ?? 0));
-  const over = Math.max(0, spool.length - SPOOL_MAX);
-  const dropped = (state.reported ? 0 : disk.dropped) + state.lost + over;
-  return {
-    breakerUntil: state.breakerUntil,
-    sessions: { ...disk.sessions, ...state.sessions },
-    spool: spool.slice(over),
-    dropped,
-    droppedSince: dropped
-      ? ((state.reported ? null : disk.droppedSince) ?? state.lostSince ?? new Date().toISOString())
-      : null,
-  };
-}
-
-/**
- * Runs `fn` holding a lock directory next to the state, so two hooks never read and write
- * the state file at once. Waits at most about two seconds; a lock older than ten seconds
- * is left over from a killed hook and is taken over.
- */
-function withLock(dir, fn) {
-  const lock = join(dir, "state.lock");
-  const deadline = Date.now() + 2000;
-  let held = false;
-  while (!held) {
-    try {
-      mkdirSync(lock);
-      held = true;
-    } catch (err) {
-      if (err?.code !== "EEXIST") break; // cannot lock here: go on without
-      try {
-        if (Date.now() - statSync(lock).mtimeMs > 10_000) rmdirSync(lock);
-      } catch {
-        // Released meanwhile.
-      }
-      if (Date.now() > deadline) break;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 10);
-    }
-  }
-  try {
-    return fn();
-  } finally {
-    if (held) {
-      try {
-        rmdirSync(lock);
-      } catch {
-        // Already gone.
-      }
-    }
-  }
 }
 
 export function saveState(state, env = process.env) {
   try {
     const dir = stateDir(env);
     mkdirSync(dir, { recursive: true });
-    withLock(dir, () => {
-      const merged = merge(state, loadState(env));
-      const keep = Object.entries(merged.sessions)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 50);
-      const file = join(dir, "state.json");
-      const tmp = `${file}.${process.pid}.tmp`;
-      writeFileSync(tmp, JSON.stringify({ ...merged, sessions: Object.fromEntries(keep) }), {
-        mode: 0o600,
-      });
-      renameSync(tmp, file);
-    });
+    const keep = Object.entries(state.sessions)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 50);
+    const file = join(dir, "state.json");
+    const tmp = `${file}.${process.pid}.tmp`;
+    writeFileSync(
+      tmp,
+      JSON.stringify({ breakerUntil: state.breakerUntil, sessions: Object.fromEntries(keep) }),
+      { mode: 0o600 },
+    );
+    renameSync(tmp, file);
   } catch {
     // State is an optimisation; losing it must not matter.
+  }
+}
+
+// ---------------------------------------------------------------------------
+// The spool: one file per unsent entry
+// ---------------------------------------------------------------------------
+//
+// An entry is written to a temporary file and renamed into the spool, so a spool file is
+// always whole, and it is removed only after Recall has taken it. Nothing rewrites the
+// spool as a whole: hooks running at the same time cannot overwrite each other's entries,
+// and a hook stopped at any moment leaves every entry it accepted on disk. A file's name
+// starts with the time its entry was said, so the sorted listing is the order to send in.
+
+const unique = () => `${process.pid}.${Date.now()}.${Math.random().toString(36).slice(2)}`;
+const entryFile = (entry) => `${String(entry.at ?? 0).padStart(15, "0")}-${entry.key}.json`;
+
+/** The spool's file names, oldest first. */
+export function spoolFiles(env = process.env) {
+  try {
+    return readdirSync(spoolDir(env))
+      .filter((n) => n.endsWith(".json"))
+      .sort();
+  } catch {
+    return [];
+  }
+}
+
+/** Writes an entry to the spool unless an entry with its key is there already. */
+function stage(entry, env = process.env) {
+  const dir = spoolDir(env);
+  mkdirSync(dir, { recursive: true });
+  if (spoolFiles(env).some((n) => n.endsWith(`-${entry.key}.json`))) return;
+  const tmp = join(dir, `.${unique()}.tmp`);
+  writeFileSync(tmp, JSON.stringify(entry), { mode: 0o600 });
+  renameSync(tmp, join(dir, entryFile(entry)));
+}
+
+/** Removes a sent entry. False when another hook removed it first. */
+function unspool(name, env = process.env) {
+  try {
+    unlinkSync(join(spoolDir(env), name));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Counts entries the spool let go of: a small file each, so no count is ever overwritten. */
+function markLost(count, since, env = process.env) {
+  try {
+    mkdirSync(lostDir(env), { recursive: true });
+    writeFileSync(join(lostDir(env), `${unique()}.json`), JSON.stringify({ count, since }), {
+      mode: 0o600,
+    });
+  } catch {
+    // Nowhere to count it; the log still says so.
+  }
+}
+
+/** What the spool has let go of and not yet reported: `{ count, since, files }`. */
+export function lostReport(env = process.env) {
+  let files = [];
+  try {
+    files = readdirSync(lostDir(env)).filter((n) => n.endsWith(".json"));
+  } catch {
+    // Nothing lost.
+  }
+  let count = 0;
+  let since = null;
+  for (const n of files) {
+    const m = readJson(join(lostDir(env), n));
+    count += Number(m?.count) || 0;
+    if (typeof m?.since === "string" && (!since || m.since < since)) since = m.since;
+  }
+  return { count, since, files };
+}
+
+/** Lets go of the oldest entries beyond SPOOL_MAX, counting each one it removes. */
+function trimSpool(settings, env = process.env) {
+  const files = spoolFiles(env);
+  for (const name of files.slice(0, Math.max(0, files.length - SPOOL_MAX))) {
+    if (!unspool(name, env)) continue;
+    const at = Number(name.split("-")[0]);
+    markLost(1, new Date(at || Date.now()).toISOString(), env);
+    log(settings, `spool full (${SPOOL_MAX} messages): let go of ${name}, the oldest`, env);
   }
 }
 
@@ -381,10 +410,11 @@ export function sessionSetup(settings, input) {
   };
 }
 
-async function ensureSession(settings, state, sessionId, setup) {
+async function ensureSession(settings, state, sessionId, setup, timeoutMs) {
   if (state.sessions[sessionId]) return 200;
   const res = await request(settings, "POST", ws(settings, "/sessions"), {
     body: { id: sessionId, ...setup },
+    timeoutMs,
   });
   if (res.status >= 200 && res.status < 300) state.sessions[sessionId] = Date.now();
   return res.status;
@@ -400,10 +430,15 @@ export async function setupSession(settings, state, sessionId, input, env = proc
   }
 }
 
-/** Sends one spooled/pending entry. Returns "ok", "retry" (try again later) or "drop". */
-async function deliver(settings, state, entry) {
-  const setup = await ensureSession(settings, state, entry.session, entry.setup);
+/**
+ * Sends one spooled entry, each request within the usual timeout and never past `deadline`.
+ * Returns "ok", "retry" (try again later) or "drop".
+ */
+async function deliver(settings, state, entry, deadline) {
+  const wait = () => Math.min(settings.timeoutMs, deadline - Date.now());
+  const setup = await ensureSession(settings, state, entry.session, entry.setup, wait());
   if (transient(setup)) return "retry";
+  if (wait() < 200) return "retry";
   const res = await request(
     settings,
     "POST",
@@ -411,71 +446,64 @@ async function deliver(settings, state, entry) {
     {
       body: { messages: entry.messages },
       headers: { "idempotency-key": entry.key },
+      timeoutMs: wait(),
     },
   );
   if (res.status >= 200 && res.status < 300) return "ok";
   return transient(res.status) ? "retry" : "drop";
 }
 
+const budgetMs = (env = process.env) =>
+  Number(env.RECALL_HOOK_BUDGET_MS) > 0 ? Number(env.RECALL_HOOK_BUDGET_MS) : 5000;
+
 /**
- * Retries what an earlier outage left behind, oldest first, a few at a time: "empty" when
- * nothing is left, "busy" when older messages still wait (a new one must queue behind them),
- * "down" when Recall did not take them.
+ * Sends the spool oldest first until it is empty ("empty"), Recall does not take an entry
+ * ("down"), or this hook's time budget or batch is spent ("busy"); no request runs past the
+ * budget. An entry leaves the spool only after Recall took it (or refused it for good).
  */
-async function flushSpool(settings, state) {
+async function flushSpool(settings, state, env = process.env) {
+  const deadline = STARTED + budgetMs(env);
   let sent = 0;
-  while (state.spool.length) {
-    if (sent >= SPOOL_FLUSH_PER_RUN) return "busy";
-    const entry = state.spool[0];
-    const outcome = await deliver(settings, state, entry);
-    if (outcome === "retry") return "down";
-    if (outcome === "drop") log(settings, `the server rejected message ${entry.key}; dropped`);
-    state.done.add(entry.key);
-    state.spool.shift();
+  for (const name of spoolFiles(env)) {
+    const left = deadline - Date.now();
+    if (sent >= SPOOL_FLUSH_PER_RUN || left < 500) return "busy";
+    const entry = readJson(join(spoolDir(env), name));
+    if (!entry?.key) continue; // sent by another hook meanwhile
+    const outcome = await deliver(settings, state, entry, deadline);
+    // Out of time is not an outage: the next hook carries on.
+    if (outcome === "retry") return Date.now() >= deadline - 300 ? "busy" : "down";
+    if (outcome === "drop") log(settings, `the server rejected message ${entry.key}; dropped`, env);
+    unspool(name, env);
     sent++;
   }
   return "empty";
 }
 
-/** Keeps an entry for later, after the ones already waiting. A full spool lets go of the oldest, and counts it. */
-function enqueue(settings, state, entry, env = process.env) {
-  if (state.spool.some((e) => e.key === entry.key)) return;
-  state.spool.push(entry);
-  while (state.spool.length > SPOOL_MAX) {
-    const lost = state.spool.shift();
-    state.done.add(lost.key);
-    state.lost++;
-    state.lostSince ??= new Date(lost.at ?? Date.now()).toISOString();
-    log(settings, `spool full (${SPOOL_MAX} messages): let go of ${lost.key}, the oldest`, env);
-  }
-}
-
 /**
- * Records messages into the session: older unsent messages first, then these. If
- * Recall is down the entry is spooled (and the breaker trips), never raised.
+ * Records messages into the session. The entry goes to the spool first, so it survives
+ * whatever happens next (an outage, the agent stopping the hook); then the spool is sent,
+ * oldest first and this entry with it, within the hook's time budget. Never throws.
  */
 export async function record(settings, state, input, env = process.env) {
   const entry = { at: Date.now(), ...input };
-  if (breakerOpen(state)) return enqueue(settings, state, entry, env);
-  const backlog = await flushSpool(settings, state);
-  if (backlog === "down") {
-    tripBreaker(state, env);
-    return enqueue(settings, state, entry, env);
+  try {
+    stage(entry, env);
+  } catch (err) {
+    log(settings, `could not write the spool (${err?.message ?? err}); sending directly`, env);
+    if (breakerOpen(state)) return;
+    const outcome = await deliver(settings, state, entry, STARTED + budgetMs(env));
+    if (outcome !== "ok") log(settings, `message ${entry.key} was not stored (${outcome})`, env);
+    return;
   }
-  // Older messages still waiting go first; this one follows them on a later hook.
-  if (backlog === "busy") return enqueue(settings, state, entry, env);
-  const outcome = await deliver(settings, state, entry);
-  if (outcome !== "retry") state.done.add(entry.key);
-  if (outcome === "retry") {
+  trimSpool(settings, env);
+  if (breakerOpen(state)) return;
+  if ((await flushSpool(settings, state, env)) === "down") {
     tripBreaker(state, env);
-    enqueue(settings, state, entry, env);
     log(
       settings,
-      `could not reach ${settings.url}; message kept for later (${state.spool.length} waiting)`,
+      `could not reach ${settings.url}; ${spoolFiles(env).length} message(s) kept for later`,
       env,
     );
-  } else if (outcome === "drop") {
-    log(settings, `the server rejected message ${entry.key}; dropped`, env);
   }
 }
 
@@ -523,22 +551,27 @@ export async function fetchMemory(
 
 /**
  * A line for the agent's context when memory is behind: messages waiting to be stored, or let
- * go of during a long outage. Reporting the loss clears the count.
+ * go of during a long outage. Reporting the loss clears its count.
  */
-export function backlogNotice(state) {
+export function backlogNotice(env = process.env) {
   const notes = [];
-  if (state.spool.length)
+  const waiting = spoolFiles(env).length;
+  if (waiting)
     notes.push(
-      `${state.spool.length} recorded message${state.spool.length === 1 ? " is" : "s are"} waiting to be stored in Recall (it could not be reached); memory below may be missing them.`,
+      `${waiting} recorded message${waiting === 1 ? " is" : "s are"} waiting to be stored in Recall (it could not be reached); memory below may be missing them.`,
     );
-  const lost = state.dropped + state.lost;
-  if (lost) {
+  const lost = lostReport(env);
+  if (lost.count) {
     notes.push(
-      `${lost} message${lost === 1 ? " was" : "s were"} not stored: Recall was unreachable for longer than the plugin can keep messages (since ${state.droppedSince ?? state.lostSince}).`,
+      `${lost.count} message${lost.count === 1 ? " was" : "s were"} not stored: Recall was unreachable for longer than the plugin can keep messages (since ${lost.since ?? "an earlier session"}).`,
     );
-    state.reported = true;
-    state.lost = 0;
-    state.lostSince = null;
+    for (const n of lost.files) {
+      try {
+        unlinkSync(join(lostDir(env), n));
+      } catch {
+        // Reported by another hook already.
+      }
+    }
   }
   return notes.length ? `Recall memory status: ${notes.join(" ")}` : "";
 }
