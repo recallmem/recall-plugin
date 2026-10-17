@@ -93,6 +93,11 @@ inside Claude Code's timeout; what is left goes with the next hook. The spool ho
 outlasts that, the oldest are let go of, and the next session's context and `/recall-memory:status` say how many
 and since when.
 
+A refused API key (revoked, or missing) or an account out of credit is treated the same way: messages stay on disk
+and are sent once it is fixed, and the session context and `/recall-memory:status` say why they are waiting. Only
+a message Recall rejects as such (a malformed one, say) leaves the spool unsent; it is counted and reported the
+same way, never dropped silently.
+
 ## Troubleshooting
 
 Hooks never print errors into the session. They log to `hooks.log` in the plugin's data directory

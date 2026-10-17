@@ -165,6 +165,7 @@ export const messageMetadata = (input) => ({
 const stateDir = (env = process.env) => HOST_INFO.stateDir(env);
 const spoolDir = (env = process.env) => join(stateDir(env), "spool");
 const lostDir = (env = process.env) => join(stateDir(env), "lost");
+const refusedFile = (env = process.env) => join(stateDir(env), "refused.json");
 
 /**
  * state.json holds only what may be lost without harm: when the breaker closes again and
@@ -246,19 +247,30 @@ function unspool(name, env = process.env) {
   }
 }
 
-/** Counts entries the spool let go of: a small file each, so no count is ever overwritten. */
-function markLost(count, since, env = process.env) {
+/**
+ * Counts entries the spool let go of: a small file each, so no count is ever overwritten.
+ * `reason` is "full" (an outage outlasted the spool) or "rejected" (Recall refused the
+ * message itself for good).
+ */
+function markLost(count, since, env = process.env, reason = "full") {
   try {
     mkdirSync(lostDir(env), { recursive: true });
-    writeFileSync(join(lostDir(env), `${unique()}.json`), JSON.stringify({ count, since }), {
-      mode: 0o600,
-    });
+    writeFileSync(
+      join(lostDir(env), `${unique()}.json`),
+      JSON.stringify({ count, since, reason }),
+      {
+        mode: 0o600,
+      },
+    );
   } catch {
     // Nowhere to count it; the log still says so.
   }
 }
 
-/** What the spool has let go of and not yet reported: `{ count, since, files }`. */
+/**
+ * What the spool has let go of and not yet reported: `{ count, since, files, rejected }`,
+ * `rejected` being how many of `count` Recall refused rather than an outage cost.
+ */
 export function lostReport(env = process.env) {
   let files = [];
   try {
@@ -267,13 +279,52 @@ export function lostReport(env = process.env) {
     // Nothing lost.
   }
   let count = 0;
+  let rejected = 0;
   let since = null;
   for (const n of files) {
     const m = readJson(join(lostDir(env), n));
     count += Number(m?.count) || 0;
+    if (m?.reason === "rejected") rejected += Number(m.count) || 0;
     if (typeof m?.since === "string" && (!since || m.since < since)) since = m.since;
   }
-  return { count, since, files };
+  return { count, since, files, rejected };
+}
+
+/**
+ * Refusals the user can fix: a missing or revoked key, an account out of credit, a key
+ * without access to the workspace. Messages wait in the spool until Recall takes them.
+ */
+const REFUSALS = new Map([
+  [401, "Recall refused the API key"],
+  [402, "the Recall account is out of credit"],
+  [403, "the API key has no access to this workspace"],
+]);
+
+/** Notes that Recall refuses messages (kept until it takes one again), for the status line. */
+function markRefused(status, env = process.env) {
+  const before = refusal(env);
+  const since = before?.status === status ? before.since : new Date().toISOString();
+  try {
+    writeFileSync(refusedFile(env), JSON.stringify({ status, since }), { mode: 0o600 });
+  } catch {
+    // The log still says so.
+  }
+}
+
+/** Why Recall refuses messages, if it does: `{ status, reason, since }`, else null. */
+export function refusal(env = process.env) {
+  const r = readJson(refusedFile(env));
+  return r && REFUSALS.has(r.status)
+    ? { status: r.status, reason: REFUSALS.get(r.status), since: r.since }
+    : null;
+}
+
+function clearRefused(env = process.env) {
+  try {
+    unlinkSync(refusedFile(env));
+  } catch {
+    // Not refused.
+  }
 }
 
 /** Lets go of the oldest entries beyond SPOOL_MAX, counting each one it removes. */
@@ -335,7 +386,7 @@ export async function request(settings, method, path, { body, headers = {}, time
     try {
       json = text ? JSON.parse(text) : null;
     } catch {}
-    return { status: res.status, json };
+    return { status: res.status, json, retryAfter: res.headers.has("retry-after") };
   } catch (err) {
     return { status: 0, error: err?.cause?.code ?? err?.name ?? String(err) };
   }
@@ -434,11 +485,18 @@ export async function setupSession(settings, state, sessionId, input, env = proc
  * Sends one spooled entry, each request within the usual timeout and never past `deadline`.
  * Returns "ok", "retry" (try again later) or "drop".
  */
+/**
+ * Sends one entry and says what became of it: "ok" (Recall took it), "retry" (unreachable or
+ * out of time), "busy" (Recall asks to send it again shortly: another hook is writing to the
+ * session), "refused" (the credentials, see REFUSALS) or "rejected" (this message, for good).
+ * `status` is the HTTP status behind it.
+ */
 async function deliver(settings, state, entry, deadline) {
   const wait = () => Math.min(settings.timeoutMs, deadline - Date.now());
   const setup = await ensureSession(settings, state, entry.session, entry.setup, wait());
-  if (transient(setup)) return "retry";
-  if (wait() < 200) return "retry";
+  if (transient(setup)) return { outcome: "retry", status: setup };
+  if (REFUSALS.has(setup)) return { outcome: "refused", status: setup };
+  if (wait() < 200) return { outcome: "retry", status: 0 };
   const res = await request(
     settings,
     "POST",
@@ -449,17 +507,27 @@ async function deliver(settings, state, entry, deadline) {
       timeoutMs: wait(),
     },
   );
-  if (res.status >= 200 && res.status < 300) return "ok";
-  return transient(res.status) ? "retry" : "drop";
+  const outcome =
+    res.status >= 200 && res.status < 300
+      ? "ok"
+      : transient(res.status)
+        ? "retry"
+        : res.status === 409 && res.retryAfter
+          ? "busy"
+          : REFUSALS.has(res.status)
+            ? "refused"
+            : "rejected";
+  return { outcome, status: res.status };
 }
 
 const budgetMs = (env = process.env) =>
   Number(env.RECALL_HOOK_BUDGET_MS) > 0 ? Number(env.RECALL_HOOK_BUDGET_MS) : 5000;
 
 /**
- * Sends the spool oldest first until it is empty ("empty"), Recall does not take an entry
- * ("down"), or this hook's time budget or batch is spent ("busy"); no request runs past the
- * budget. An entry leaves the spool only after Recall took it (or refused it for good).
+ * Sends the spool oldest first until it is empty ("empty"), Recall cannot be reached ("down"),
+ * Recall refuses the credentials ("refused"), or this hook's time budget or batch is spent or
+ * Recall asks to wait ("busy"); no request runs past the budget. An entry leaves the spool only
+ * after Recall took it, or rejected that message for good, which is counted and reported.
  */
 async function flushSpool(settings, state, env = process.env) {
   const deadline = STARTED + budgetMs(env);
@@ -469,10 +537,28 @@ async function flushSpool(settings, state, env = process.env) {
     if (sent >= SPOOL_FLUSH_PER_RUN || left < 500) return "busy";
     const entry = readJson(join(spoolDir(env), name));
     if (!entry?.key) continue; // sent by another hook meanwhile
-    const outcome = await deliver(settings, state, entry, deadline);
+    const { outcome, status } = await deliver(settings, state, entry, deadline);
     // Out of time is not an outage: the next hook carries on.
     if (outcome === "retry") return Date.now() >= deadline - 300 ? "busy" : "down";
-    if (outcome === "drop") log(settings, `the server rejected message ${entry.key}; dropped`, env);
+    // Nothing goes ahead of this entry: the next hook sends it.
+    if (outcome === "busy") return "busy";
+    if (outcome === "refused") {
+      markRefused(status, env);
+      log(
+        settings,
+        `${REFUSALS.get(status)} (HTTP ${status}); messages kept until it is fixed`,
+        env,
+      );
+      return "refused";
+    }
+    clearRefused(env);
+    if (outcome === "rejected") {
+      if (!unspool(name, env)) continue;
+      markLost(1, new Date(Number(entry.at) || Date.now()).toISOString(), env, "rejected");
+      log(settings, `Recall rejected message ${entry.key} (HTTP ${status}); counted as lost`, env);
+      sent++;
+      continue;
+    }
     unspool(name, env);
     sent++;
   }
@@ -491,8 +577,9 @@ export async function record(settings, state, input, env = process.env) {
   } catch (err) {
     log(settings, `could not write the spool (${err?.message ?? err}); sending directly`, env);
     if (breakerOpen(state)) return;
-    const outcome = await deliver(settings, state, entry, STARTED + budgetMs(env));
-    if (outcome !== "ok") log(settings, `message ${entry.key} was not stored (${outcome})`, env);
+    const { outcome, status } = await deliver(settings, state, entry, STARTED + budgetMs(env));
+    if (outcome !== "ok")
+      log(settings, `message ${entry.key} was not stored (HTTP ${status})`, env);
     return;
   }
   trimSpool(settings, env);
@@ -556,15 +643,22 @@ export async function fetchMemory(
 export function backlogNotice(env = process.env) {
   const notes = [];
   const waiting = spoolFiles(env).length;
+  const refused = refusal(env);
   if (waiting)
     notes.push(
-      `${waiting} recorded message${waiting === 1 ? " is" : "s are"} waiting to be stored in Recall (it could not be reached); memory below may be missing them.`,
+      `${waiting} recorded message${waiting === 1 ? " is" : "s are"} waiting to be stored in Recall (${refused ? `${refused.reason}, HTTP ${refused.status}; they are sent once that is fixed` : "it could not be reached"}); memory below may be missing them.`,
     );
   const lost = lostReport(env);
-  if (lost.count) {
+  const full = lost.count - lost.rejected;
+  if (full)
     notes.push(
-      `${lost.count} message${lost.count === 1 ? " was" : "s were"} not stored: Recall was unreachable for longer than the plugin can keep messages (since ${lost.since ?? "an earlier session"}).`,
+      `${full} message${full === 1 ? " was" : "s were"} not stored: Recall was unreachable for longer than the plugin can keep messages (since ${lost.since ?? "an earlier session"}).`,
     );
+  if (lost.rejected)
+    notes.push(
+      `Recall rejected ${lost.rejected} message${lost.rejected === 1 ? "" : "s"} for good (see hooks.log in the plugin's data directory).`,
+    );
+  if (lost.count) {
     for (const n of lost.files) {
       try {
         unlinkSync(join(lostDir(env), n));
