@@ -1,0 +1,39 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+# CodeRabbit reviews every pull request to this repository. The instructions below point it at the
+# promises the plugin READMEs make and the hook code that has to keep them.
+language: en-US
+tone_instructions: >-
+  Plain, direct English. Report bugs with a concrete failing input or sequence of events; skip
+  style preferences.
+reviews:
+  profile: chill
+  poem: false
+  high_level_summary: true
+  collapse_walkthrough: true
+  request_changes_workflow: false
+  auto_review:
+    enabled: true
+    drafts: false
+  path_filters:
+    - "!**/*.png"
+    - "!**/*.svg"
+  path_instructions:
+    - path: "{plugins/recall-memory,integrations/codex}/scripts/**"
+      instructions: |
+        Hooks of the Claude Code and Codex plugins (they share lib.mjs). The README promises:
+        every prompt and reply is written to disk (one spool file each) before anything is sent,
+        and the file is removed only after Recall has taken the message; a message Recall rejects
+        for good is counted and reported, never dropped silently; messages are sent oldest first
+        within a time budget so a hook finishes well inside the host's hook timeout; hooks never
+        block or fail the agent. Check each change against these, with hooks running at the same
+        time as separate processes, a hook killed (SIGKILL) at any line, and a server that is slow,
+        unreachable, or answers 401/402/403/409/422/429/500. Flag any path that removes a spool
+        file without Recall having taken the message or counting it as lost, and any write that
+        another hook could overwrite with an older copy.
+    - path: "**/*.md"
+      instructions: |
+        Public text. Flag any promise the hook code does not keep. The plugins and integrations
+        are MIT; the Recall server they talk to is source-available (FSL-1.1-ALv2), never open
+        source.
+chat:
+  auto_reply: true
