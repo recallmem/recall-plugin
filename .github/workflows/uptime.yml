@@ -1,10 +1,11 @@
-# Checks recallmem.dev every 10 minutes. A failed run means a check stayed down for three tries
-# over about 30 seconds; GitHub emails the repository owner about failed scheduled runs.
+# Checks recallmem.dev every hour (more often kept the hosted database from ever suspending). A
+# failed run means a check stayed down for three tries over about 30 seconds; GitHub emails the
+# repository owner about failed scheduled runs.
 name: Uptime
 
 on:
   schedule:
-    - cron: "*/10 * * * *"
+    - cron: "17 * * * *"
   workflow_dispatch:
 
 permissions: {}
